@@ -1,0 +1,206 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © Infusion Capital — IC Trade Max Oscillator v1.0
+// Visual replica inspired by TRADE MAX® Oscillator™ — built independently from scratch
+// @version=6
+
+indicator("IC — Trade Max Oscillator", shorttitle="IC TMO", overlay=false,
+          max_labels_count=500, max_lines_count=500)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────────────────────────
+grp_t = "Trailing Stop"
+show_trail  = input.bool(true,  "Show Trailing Stop Line",  group=grp_t)
+trail_atr   = input.int(11,     "ATR Period",               minval=1, maxval=50,        group=grp_t)
+trail_mult  = input.float(2.5,  "ATR Multiplier",           minval=0.1, maxval=10.0, step=0.1, group=grp_t)
+
+grp_o = "Oscillator"
+src        = input.source(close, "Source",                  group=grp_o)
+rsi_len    = input.int(14,  "RSI Length",                   minval=2, maxval=50,        group=grp_o)
+smooth_len = input.int(3,   "Smoothing (EMA)",              minval=1, maxval=20,        group=grp_o)
+sig_len    = input.int(9,   "Signal Length (EMA)",          minval=1, maxval=30,        group=grp_o)
+
+grp_d = "Divergence"
+show_div   = input.bool(true, "Show Divergence Marks",      group=grp_d)
+div_lb     = input.int(5,   "Pivot Lookback",               minval=2, maxval=20,        group=grp_d)
+
+grp_c = "Colors"
+col_sb = input.color(color.new(#00E676,  0), "Strong Bull", group=grp_c)
+col_wb = input.color(color.new(#00E676, 60), "Weak Bull",   group=grp_c)
+col_sr = input.color(color.new(#FF1744,  0), "Strong Bear", group=grp_c)
+col_wr = input.color(color.new(#FF1744, 60), "Weak Bear",   group=grp_c)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TRAILING STOP — Chandelier Exit (ATR-based)
+// Drawn as line segments on the PRICE CHART (label/line draw on main chart
+// even from overlay=false indicators, using bar_index + price coordinates)
+// ──────────────────────────────────────────────────────────────────────────────
+atr_v    = ta.atr(trail_atr)
+trail_up = close - trail_mult * atr_v
+trail_dn = close + trail_mult * atr_v
+
+var float trail = na
+var bool  up    = true
+
+if na(trail)
+    trail := trail_up
+    up    := true
+
+if up
+    trail := math.max(nz(trail), trail_up)
+    if close < trail
+        up    := false
+        trail := trail_dn
+else
+    trail := math.min(nz(trail), trail_dn)
+    if close > trail
+        up    := true
+        trail := trail_up
+
+t_col = up ? color.new(#00BCD4, 0) : color.new(#FF1744, 0)
+
+// One line segment per bar — rolling 490-segment window on price chart
+var line[] t_segs = array.new_line(0)
+
+if show_trail and bar_index > 0 and not na(trail) and not na(trail[1])
+    if array.size(t_segs) >= 490
+        line.delete(array.shift(t_segs))
+    array.push(t_segs,
+        line.new(bar_index - 1, trail[1], bar_index, trail,
+                 color=t_col, width=2, style=line.style_solid))
+
+// ──────────────────────────────────────────────────────────────────────────────
+// OSCILLATOR — RSI Momentum (centered at 0)
+// ──────────────────────────────────────────────────────────────────────────────
+rsi_v = ta.rsi(src, rsi_len)
+mom   = rsi_v - 50.0                   // center: 0 = neutral, +25 = overbought, -25 = oversold
+osc   = ta.ema(mom, smooth_len)        // smoothed momentum line
+sig   = ta.ema(osc, sig_len)           // signal line
+hist  = osc - sig                      // histogram
+
+// 4-state histogram: strong/weak bull/bear based on value AND direction
+hist_col = hist >= 0 and hist >= hist[1] ? col_sb :
+           hist >= 0 and hist <  hist[1] ? col_wb :
+           hist <  0 and hist <= hist[1] ? col_sr :
+           col_wr
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MOMENTUM STATE
+// ──────────────────────────────────────────────────────────────────────────────
+mom_bull  = osc > 0 and osc > sig
+mom_bear  = osc < 0 and osc < sig
+mom_str   = mom_bull ? "Bullish" : mom_bear ? "Bearish" : "Neutral"
+mom_col   = mom_bull ? color.teal : mom_bear ? color.red : color.gray
+mom_pct   = math.min(math.round(math.abs(osc) / 25.0 * 100, 1), 100.0)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SIGNAL DETECTION — Zero-cross + Signal-cross + Trend alignment
+// Grades: 1 (strongest) → 4 (weakest)
+// ──────────────────────────────────────────────────────────────────────────────
+cross_up = ta.crossover(osc,  0.0)
+cross_dn = ta.crossunder(osc, 0.0)
+sig_up   = ta.crossover(osc,  sig)
+sig_dn   = ta.crossunder(osc, sig)
+
+bull_g1 = cross_up and up
+bull_g2 = sig_up   and up     and not bull_g1
+bull_g3 = sig_up   and not up
+bull_g4 = hist >= 0 and hist[1] < 0 and not bull_g1 and not bull_g2 and not bull_g3
+
+bear_g1 = cross_dn and not up
+bear_g2 = sig_dn   and not up and not bear_g1
+bear_g3 = sig_dn   and up
+bear_g4 = hist <= 0 and hist[1] > 0 and not bear_g1 and not bear_g2 and not bear_g3
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DIVERGENCE — Pivot-based (regular)
+// ──────────────────────────────────────────────────────────────────────────────
+ph = ta.pivothigh(osc, div_lb, div_lb)
+pl = ta.pivotlow(osc,  div_lb, div_lb)
+
+bear_div = not na(ph) and high[div_lb] > high[div_lb * 2] and osc[div_lb] < osc[div_lb * 2]
+bull_div = not na(pl) and low[div_lb]  < low[div_lb * 2]  and osc[div_lb] > osc[div_lb * 2]
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PRICE CHART LABELS — grade badges drawn at candle high/low on main chart
+// (drawings use bar_index + price coords → appear on price chart even from
+//  overlay=false indicators)
+// ──────────────────────────────────────────────────────────────────────────────
+if bull_g1
+    label.new(bar_index, low,  "1", style=label.style_label_up,   color=color.new(#00C853,  0), textcolor=color.white, size=size.small)
+if bull_g2
+    label.new(bar_index, low,  "2", style=label.style_label_up,   color=color.new(#00C853, 25), textcolor=color.white, size=size.small)
+if bull_g3
+    label.new(bar_index, low,  "3", style=label.style_label_up,   color=color.new(#00C853, 50), textcolor=color.white, size=size.small)
+if bull_g4
+    label.new(bar_index, low,  "4", style=label.style_label_up,   color=color.new(#00BCD4, 35), textcolor=color.white, size=size.small)
+
+if bear_g1
+    label.new(bar_index, high, "1", style=label.style_label_down, color=color.new(#FF1744,  0), textcolor=color.white, size=size.small)
+if bear_g2
+    label.new(bar_index, high, "2", style=label.style_label_down, color=color.new(#FF1744, 25), textcolor=color.white, size=size.small)
+if bear_g3
+    label.new(bar_index, high, "3", style=label.style_label_down, color=color.new(#FF1744, 50), textcolor=color.white, size=size.small)
+if bear_g4
+    label.new(bar_index, high, "4", style=label.style_label_down, color=color.new(#FF9800, 35), textcolor=color.white, size=size.small)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// OSCILLATOR PLOTS — appear in indicator pane (overlay=false)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Trend background
+bgcolor(up ? color.new(color.teal, 95) : color.new(color.red, 95))
+
+// Core plots
+plot(hist,  "Histogram",  style=plot.style_histogram, color=hist_col, linewidth=2)
+plot(osc,   "Oscillator", color=color.new(color.white,  20), linewidth=2)
+plot(sig,   "Signal",     color=color.new(#FF9800,      20), linewidth=1)
+
+// Reference lines
+hline(0,   "Zero", color=color.new(color.gray, 40), linestyle=hline.style_solid,  linewidth=1)
+hline(25,  "OB",   color=color.new(color.red,  70), linestyle=hline.style_dashed, linewidth=1)
+hline(-25, "OS",   color=color.new(color.teal, 70), linestyle=hline.style_dashed, linewidth=1)
+
+// Zero-cross buy/sell dots
+plotshape(cross_up, "Bull Entry", location=location.bottom, style=shape.circle,
+          color=color.new(#69F0AE, 0), size=size.small)
+plotshape(cross_dn, "Bear Entry", location=location.top,    style=shape.circle,
+          color=color.new(#FF5252, 0), size=size.small)
+
+// Grade labels in oscillator pane (const string — one call per grade)
+plotshape(bull_g1, "B1", location=location.bottom, style=shape.labelup,   color=color.new(#00C853,  0), textcolor=color.white, size=size.tiny, text="1")
+plotshape(bull_g2, "B2", location=location.bottom, style=shape.labelup,   color=color.new(#00C853, 25), textcolor=color.white, size=size.tiny, text="2")
+plotshape(bull_g3, "B3", location=location.bottom, style=shape.labelup,   color=color.new(#00C853, 50), textcolor=color.white, size=size.tiny, text="3")
+plotshape(bull_g4, "B4", location=location.bottom, style=shape.labelup,   color=color.new(#00BCD4, 35), textcolor=color.white, size=size.tiny, text="4")
+plotshape(bear_g1, "R1", location=location.top,    style=shape.labeldown, color=color.new(#FF1744,  0), textcolor=color.white, size=size.tiny, text="1")
+plotshape(bear_g2, "R2", location=location.top,    style=shape.labeldown, color=color.new(#FF1744, 25), textcolor=color.white, size=size.tiny, text="2")
+plotshape(bear_g3, "R3", location=location.top,    style=shape.labeldown, color=color.new(#FF1744, 50), textcolor=color.white, size=size.tiny, text="3")
+plotshape(bear_g4, "R4", location=location.top,    style=shape.labeldown, color=color.new(#FF9800, 35), textcolor=color.white, size=size.tiny, text="4")
+
+// Divergence markers
+plotshape(show_div and bull_div, "Bull Div", location=location.bottom,
+          style=shape.triangleup,   color=color.new(color.yellow, 0), size=size.tiny)
+plotshape(show_div and bear_div, "Bear Div", location=location.top,
+          style=shape.triangledown, color=color.new(color.yellow, 0), size=size.tiny)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ──────────────────────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 3,
+                 bgcolor      = color.new(color.black, 15),
+                 border_color = color.gray,
+                 border_width = 1,
+                 frame_color  = color.gray,
+                 frame_width  = 1)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "IC TMO",       text_color=color.white,  bgcolor=color.new(color.gray,  50), text_size=size.small)
+    table.cell(dash, 1, 0, "IC Analytics", text_color=color.yellow, bgcolor=color.new(color.gray,  50), text_size=size.tiny)
+    table.cell(dash, 0, 1, mom_str,        text_color=mom_col,      bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(mom_pct) + "%",
+               text_color=mom_col, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 0, 2, up ? "▲ Trend UP" : "▼ Trend DN",
+               text_color=up ? color.teal : color.red,
+               bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 1, 2, "Trail " + str.tostring(math.round(trail, 2)),
+               text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.tiny)
