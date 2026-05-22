@@ -1,0 +1,553 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © Infusion Capital — Power Session Pulse PRO v1.0
+// @version=6
+
+indicator("Power Session Pulse (PSP PRO)", shorttitle="PSP PRO", overlay=true,
+          max_boxes_count=500, max_lines_count=500, max_labels_count=200)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INPUTS — Volume Profile
+// ──────────────────────────────────────────────────────────────────────────────
+grp_vp      = "Volume Profile"
+vp_lookback = input.int(200,    "Lookback Bars",      minval=50,  maxval=300,  group=grp_vp)
+vp_rows     = input.int(50,     "Row Count",          minval=10,  maxval=100,  group=grp_vp)
+vp_width    = input.int(15,     "Profile Width (%)",  minval=5,   maxval=40,   group=grp_vp)
+va_pct      = input.float(0.70, "Value Area %",       minval=0.5, maxval=0.9,  step=0.05, group=grp_vp)
+
+// INPUTS — Colors
+grp_col     = "Colors"
+col_buy     = input.color(color.new(#26A69A, 65), "Buy Volume (Green)",  group=grp_col)
+col_sell    = input.color(color.new(#F48FB1, 65), "Sell Volume (Rose)",  group=grp_col)
+col_poc_c   = input.color(color.new(#FFB300,  0), "POC Line (Amber)",    group=grp_col)
+col_gap     = input.color(color.new(#9C27B0, 65), "Volume Gap (Purple)", group=grp_col)
+col_va      = input.color(color.new(#1565C0, 65), "Value Area (Blue)",   group=grp_col)
+
+// INPUTS — Sessions (UTC hours — use xloc.bar_time to avoid bar distance errors)
+grp_sess    = "Sessions (UTC Hours)"
+show_sess   = input.bool(true, "Show Session Boxes", group=grp_sess)
+asia_st     = input.int(0,  "Asia Start",   minval=0, maxval=23, group=grp_sess)
+asia_en     = input.int(9,  "Asia End",     minval=0, maxval=23, group=grp_sess)
+lon_st      = input.int(8,  "London Start", minval=0, maxval=23, group=grp_sess)
+lon_en      = input.int(17, "London End",   minval=0, maxval=23, group=grp_sess)
+ny_st       = input.int(13, "NY Start",     minval=0, maxval=23, group=grp_sess)
+ny_en       = input.int(21, "NY End",       minval=0, maxval=23, group=grp_sess)
+col_asia    = input.color(color.new(#FF9800, 88), "Asia Color",             group=grp_sess)
+col_london  = input.color(color.new(#26C6DA, 88), "London Color (Emerald)", group=grp_sess)
+col_ny      = input.color(color.new(#7E57C2, 88), "NY Color (Violet)",      group=grp_sess)
+
+// INPUTS — Footprint / LTF
+grp_fp      = "Footprint / LTF"
+show_fp     = input.bool(true,  "Show Delta Signals",        group=grp_fp)
+auto_ltf    = input.bool(true,  "Auto LTF Mapping",          group=grp_fp)
+man_ltf     = input.timeframe("1", "Manual LTF (auto=off)",  group=grp_fp)
+fp_thresh   = input.float(1.5, "Delta Anomaly Threshold",    minval=1.0, maxval=5.0, step=0.1, group=grp_fp)
+
+// INPUTS — Structure
+grp_str     = "Structure Detection"
+show_mss    = input.bool(true, "Show MSS Labels",  group=grp_str)
+show_trap   = input.bool(true, "Show TRAP Labels", group=grp_str)
+swing_len   = input.int(5, "Swing Detection Length", minval=3, maxval=20, group=grp_str)
+
+// INPUTS — Dashboard
+grp_dash    = "Dashboard"
+show_dash   = input.bool(true, "Show Dashboard", group=grp_dash)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LTF AUTO-MAPPING  (1H+ → 5min | <1H → 1min)
+// ──────────────────────────────────────────────────────────────────────────────
+tf_secs = timeframe.in_seconds()
+sel_ltf = auto_ltf ? (tf_secs >= 3600 ? "5" : "1") : man_ltf
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LTF DATA  (Tick Rule: close >= open → Buy Pressure)
+// ──────────────────────────────────────────────────────────────────────────────
+ltf_close = request.security_lower_tf(syminfo.tickerid, sel_ltf, close)
+ltf_open  = request.security_lower_tf(syminfo.tickerid, sel_ltf, open)
+ltf_vol   = request.security_lower_tf(syminfo.tickerid, sel_ltf, volume)
+
+calc_buy(lc, lo, lv) =>
+    t = 0.0
+    if array.size(lc) > 0
+        for i = 0 to array.size(lc) - 1
+            c = array.get(lc, i)
+            o = array.get(lo, i)
+            v = array.get(lv, i)
+            if not na(c) and not na(o) and not na(v) and c >= o
+                t += v
+    t
+
+calc_sell(lc, lo, lv) =>
+    t = 0.0
+    if array.size(lc) > 0
+        for i = 0 to array.size(lc) - 1
+            c = array.get(lc, i)
+            o = array.get(lo, i)
+            v = array.get(lv, i)
+            if not na(c) and not na(o) and not na(v) and c < o
+                t += v
+    t
+
+buy_vol   = calc_buy(ltf_close,  ltf_open, ltf_vol)
+sell_vol  = calc_sell(ltf_close, ltf_open, ltf_vol)
+delta     = buy_vol  - sell_vol
+total_vol = buy_vol  + sell_vol
+
+// MUST be at global scope — never inside if/for blocks
+avg_vol    = ta.sma(total_vol, 20)
+is_anomaly = math.abs(delta) > nz(avg_vol) * fp_thresh
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VOLUME PROFILE — Global scope (ta.highest / ta.lowest MUST be here)
+// ──────────────────────────────────────────────────────────────────────────────
+highest_high = ta.highest(high, vp_lookback)
+lowest_low   = ta.lowest(low,  vp_lookback)
+price_range  = math.max(highest_high - lowest_low, syminfo.mintick)
+row_size     = price_range / vp_rows
+
+var float[] vp_prices = array.new_float(0)
+var float[] vp_vols   = array.new_float(0)
+var float[] vp_buys   = array.new_float(0)
+var float[] vp_sells  = array.new_float(0)
+
+var float poc_price = na
+var float vah_price = na
+var float val_price = na
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SESSION DETECTION
+// Timestamps (int) are stored instead of bar_index to allow xloc.bar_time
+// and avoid the "bar index too far" runtime error on charts with long history
+// ──────────────────────────────────────────────────────────────────────────────
+bar_h     = hour(time, "UTC")
+is_asia   = bar_h >= asia_st and bar_h < asia_en
+is_london = bar_h >= lon_st  and bar_h < lon_en
+is_ny     = bar_h >= ny_st   and bar_h < ny_en
+
+// Store open/close timestamps (milliseconds) — NOT bar_index
+var float s_asia_hi = na
+var float s_asia_lo = na
+var int   s_asia_lt = na   // opening timestamp of session
+var int   s_asia_rt = na   // closing timestamp of last bar in session
+
+var float s_lon_hi  = na
+var float s_lon_lo  = na
+var int   s_lon_lt  = na
+var int   s_lon_rt  = na
+
+var float s_ny_hi   = na
+var float s_ny_lo   = na
+var int   s_ny_lt   = na
+var int   s_ny_rt   = na
+
+// Session open: reset state and record opening timestamp
+if is_asia and not is_asia[1]
+    s_asia_hi := high
+    s_asia_lo := low
+    s_asia_lt := time
+    s_asia_rt := time_close
+
+if is_london and not is_london[1]
+    s_lon_hi  := high
+    s_lon_lo  := low
+    s_lon_lt  := time
+    s_lon_rt  := time_close
+
+if is_ny and not is_ny[1]
+    s_ny_hi   := high
+    s_ny_lo   := low
+    s_ny_lt   := time
+    s_ny_rt   := time_close
+
+// Session live: expand high/low and advance the right-edge timestamp
+if is_asia
+    s_asia_hi := math.max(s_asia_hi, high)
+    s_asia_lo := math.min(s_asia_lo, low)
+    s_asia_rt := time_close
+
+if is_london
+    s_lon_hi  := math.max(s_lon_hi, high)
+    s_lon_lo  := math.min(s_lon_lo, low)
+    s_lon_rt  := time_close
+
+if is_ny
+    s_ny_hi   := math.max(s_ny_hi, high)
+    s_ny_lo   := math.min(s_ny_lo, low)
+    s_ny_rt   := time_close
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MSS / TRAP — Global scope (ta.highest / ta.lowest MUST be here)
+// ──────────────────────────────────────────────────────────────────────────────
+swing_hi = ta.highest(high, swing_len)
+swing_lo = ta.lowest(low,  swing_len)
+
+mss_bull = close > swing_hi[1] and close[1] <= swing_hi[1]
+mss_bear = close < swing_lo[1] and close[1] >= swing_lo[1]
+
+trap_from_bull = mss_bull[1] and close < swing_lo[1]
+trap_from_bear = mss_bear[1] and close > swing_hi[1]
+
+// ──────────────────────────────────────────────────────────────────────────────
+// BREAKOUT COUNTERS
+// ──────────────────────────────────────────────────────────────────────────────
+var int  bull_bo       = 0
+var int  bear_bo       = 0
+var int  tp_hits       = 0
+var int  fake_outs     = 0
+var bool await_tp_bull = false
+var bool await_tp_bear = false
+
+if mss_bull and not trap_from_bull
+    bull_bo       += 1
+    await_tp_bull := true
+    await_tp_bear := false
+
+if mss_bear and not trap_from_bear
+    bear_bo       += 1
+    await_tp_bear := true
+    await_tp_bull := false
+
+if await_tp_bull and not na(s_lon_hi) and high >= s_lon_hi
+    tp_hits       += 1
+    await_tp_bull := false
+
+if await_tp_bear and not na(s_lon_lo) and low <= s_lon_lo
+    tp_hits       += 1
+    await_tp_bear := false
+
+if trap_from_bull or trap_from_bear
+    fake_outs     += 1
+    await_tp_bull := false
+    await_tp_bear := false
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CONFLUENCE SCORING  (4 layers → A+ | 3 → B | 2 → C)
+// ──────────────────────────────────────────────────────────────────────────────
+bull_pts = (mss_bull ? 1 : 0) +
+           (is_anomaly and delta > 0 ? 1 : 0) +
+           (not na(vah_price) and close > vah_price ? 1 : 0) +
+           (not na(s_asia_hi) and close > s_asia_hi ? 1 : 0)
+
+bear_pts = (mss_bear ? 1 : 0) +
+           (is_anomaly and delta < 0 ? 1 : 0) +
+           (not na(val_price) and close < val_price ? 1 : 0) +
+           (not na(s_asia_lo) and close < s_asia_lo ? 1 : 0)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DRAWING CONTAINERS
+// ──────────────────────────────────────────────────────────────────────────────
+var box[]   vp_boxes    = array.new_box(0)
+var line[]  vp_lines    = array.new_line(0)
+var label[] vp_labels   = array.new_label(0)
+var box[]   sess_boxes  = array.new_box(0)
+var label[] sess_labels = array.new_label(0)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MAIN DRAW BLOCK — barstate.islast
+// Full garbage collection before every redraw prevents limit saturation
+// ──────────────────────────────────────────────────────────────────────────────
+if barstate.islast
+
+    // ── Cleanup ────────────────────────────────────────
+    for b in vp_boxes
+        box.delete(b)
+    array.clear(vp_boxes)
+    for ln in vp_lines
+        line.delete(ln)
+    array.clear(vp_lines)
+    for l in vp_labels
+        label.delete(l)
+    array.clear(vp_labels)
+    for b in sess_boxes
+        box.delete(b)
+    array.clear(sess_boxes)
+    for l in sess_labels
+        label.delete(l)
+    array.clear(sess_labels)
+
+    // ── Rebuild VP data ─────────────────────────────────
+    array.clear(vp_prices)
+    array.clear(vp_vols)
+    array.clear(vp_buys)
+    array.clear(vp_sells)
+
+    for r = 0 to vp_rows - 1
+        array.push(vp_prices, lowest_low + r * row_size + row_size / 2)
+        array.push(vp_vols,   0.0)
+        array.push(vp_buys,   0.0)
+        array.push(vp_sells,  0.0)
+
+    // Proportional volume distribution across price range
+    for i = 0 to vp_lookback - 1
+        bh    = nz(high[i])
+        bl    = nz(low[i])
+        bv    = nz(volume[i])
+        bc    = nz(close[i])
+        bo    = nz(open[i])
+        bbuy  = bc >= bo ? bv * 0.6 : bv * 0.4
+        bsell = bv - bbuy
+        for r = 0 to vp_rows - 1
+            rl   = lowest_low + r * row_size
+            rh   = rl + row_size
+            ol   = math.max(bl, rl)
+            oh   = math.min(bh, rh)
+            if oh > ol and (bh - bl) > 0
+                frac = (oh - ol) / (bh - bl)
+                array.set(vp_vols,  r, array.get(vp_vols,  r) + bv    * frac)
+                array.set(vp_buys,  r, array.get(vp_buys,  r) + bbuy  * frac)
+                array.set(vp_sells, r, array.get(vp_sells, r) + bsell * frac)
+
+    // ── POC ────────────────────────────────────────────
+    max_vol      = array.max(vp_vols)
+    total_vp_vol = array.sum(vp_vols)
+    poc_idx      = array.indexof(vp_vols, max_vol)
+    poc_price   := array.get(vp_prices, poc_idx)
+
+    // ── Value Area (expand from POC until 70% of volume captured)
+    va_target = total_vp_vol * va_pct
+    va_acc    = max_vol
+    ui        = poc_idx
+    li        = poc_idx
+
+    while va_acc < va_target
+        cu = ui < vp_rows - 1
+        cd = li > 0
+        vu = cu ? array.get(vp_vols, ui + 1) : 0.0
+        vd = cd ? array.get(vp_vols, li - 1) : 0.0
+        if vu >= vd and cu
+            ui     += 1
+            va_acc += vu
+        else if cd
+            li     -= 1
+            va_acc += vd
+        else
+            break
+
+    vah_price := array.get(vp_prices, ui) + row_size / 2
+    val_price := array.get(vp_prices, li) - row_size / 2
+
+    // ── VP Bars — RIGHT SIDE, flush right, invisible borders
+    bar_width = math.round(vp_lookback * vp_width / 100)
+
+    for r = 0 to vp_rows - 1
+        rv = array.get(vp_vols,   r)
+        rp = array.get(vp_prices, r)
+        rb = array.get(vp_buys,   r)
+        nw = max_vol > 0 ? math.round(rv / max_vol * bar_width) : 1
+        nw := math.max(nw, 1)
+
+        is_poc_r = r == poc_idx
+        is_va_r  = r >= li and r <= ui
+        is_gap_r = rv < total_vp_vol * 0.005
+
+        color rc = na
+        if is_poc_r
+            rc := col_poc_c
+        else if is_va_r
+            rc := col_va
+        else if is_gap_r
+            rc := col_gap
+        else if (rb / math.max(rv, 1)) > 0.5
+            rc := col_buy
+        else
+            rc := col_sell
+
+        bx = box.new(
+             left         = bar_index - nw,
+             top          = rp + row_size * 0.50,
+             right        = bar_index,
+             bottom       = rp - row_size * 0.50,
+             bgcolor      = rc,
+             border_color = color.new(rc, 100),
+             border_width = 0)
+        array.push(vp_boxes, bx)
+
+    // ── POC Line (solid amber, no label)
+    ln_poc = line.new(
+             x1    = bar_index - vp_lookback,
+             y1    = poc_price,
+             x2    = bar_index,
+             y2    = poc_price,
+             color = col_poc_c,
+             width = 2,
+             style = line.style_solid)
+    array.push(vp_lines, ln_poc)
+
+    // ── VAH / VAL Lines (dashed + labels)
+    ln_vah = line.new(
+             x1    = bar_index - vp_lookback,
+             y1    = vah_price,
+             x2    = bar_index + 5,
+             y2    = vah_price,
+             color = color.new(color.blue, 40),
+             width = 1,
+             style = line.style_dashed)
+    ln_val = line.new(
+             x1    = bar_index - vp_lookback,
+             y1    = val_price,
+             x2    = bar_index + 5,
+             y2    = val_price,
+             color = color.new(color.blue, 40),
+             width = 1,
+             style = line.style_dashed)
+    array.push(vp_lines, ln_vah)
+    array.push(vp_lines, ln_val)
+
+    l_vah = label.new(bar_index + 7, vah_price,
+             "VAH " + str.tostring(math.round(vah_price, 2)),
+             color     = color.new(color.blue, 40),
+             textcolor = color.white,
+             style     = label.style_label_left,
+             size      = size.small)
+    l_val = label.new(bar_index + 7, val_price,
+             "VAL " + str.tostring(math.round(val_price, 2)),
+             color     = color.new(color.blue, 40),
+             textcolor = color.white,
+             style     = label.style_label_left,
+             size      = size.small)
+    array.push(vp_labels, l_vah)
+    array.push(vp_labels, l_val)
+
+    // ── Session Boxes — xloc.bar_time avoids "bar index too far" error
+    if show_sess
+
+        if not na(s_asia_lt)
+            bxa = box.new(
+                  left         = s_asia_lt,
+                  top          = s_asia_hi,
+                  right        = s_asia_rt,
+                  bottom       = s_asia_lo,
+                  bgcolor      = col_asia,
+                  border_color = color.new(#FF9800, 40),
+                  border_style = line.style_dashed,
+                  border_width = 1,
+                  xloc         = xloc.bar_time)
+            la = label.new(s_asia_lt, s_asia_hi,
+                 "ASIA  H:" + str.tostring(math.round(s_asia_hi, 2)) +
+                 "  L:"     + str.tostring(math.round(s_asia_lo, 2)),
+                 xloc      = xloc.bar_time,
+                 color     = color.new(#FF9800, 50),
+                 textcolor = color.white,
+                 style     = label.style_label_right,
+                 size      = size.small)
+            array.push(sess_boxes,  bxa)
+            array.push(sess_labels, la)
+
+        if not na(s_lon_lt)
+            bxl = box.new(
+                  left         = s_lon_lt,
+                  top          = s_lon_hi,
+                  right        = s_lon_rt,
+                  bottom       = s_lon_lo,
+                  bgcolor      = col_london,
+                  border_color = color.new(#26C6DA, 40),
+                  border_style = line.style_dashed,
+                  border_width = 1,
+                  xloc         = xloc.bar_time)
+            ll = label.new(s_lon_lt, s_lon_hi,
+                 "LONDON  H:" + str.tostring(math.round(s_lon_hi, 2)) +
+                 "  L:"       + str.tostring(math.round(s_lon_lo, 2)),
+                 xloc      = xloc.bar_time,
+                 color     = color.new(#26C6DA, 50),
+                 textcolor = color.white,
+                 style     = label.style_label_right,
+                 size      = size.small)
+            array.push(sess_boxes,  bxl)
+            array.push(sess_labels, ll)
+
+        if not na(s_ny_lt)
+            bxn = box.new(
+                  left         = s_ny_lt,
+                  top          = s_ny_hi,
+                  right        = s_ny_rt,
+                  bottom       = s_ny_lo,
+                  bgcolor      = col_ny,
+                  border_color = color.new(#7E57C2, 40),
+                  border_style = line.style_dashed,
+                  border_width = 1,
+                  xloc         = xloc.bar_time)
+            ln2 = label.new(s_ny_lt, s_ny_hi,
+                 "NY  H:" + str.tostring(math.round(s_ny_hi, 2)) +
+                 "  L:"   + str.tostring(math.round(s_ny_lo, 2)),
+                 xloc      = xloc.bar_time,
+                 color     = color.new(#7E57C2, 50),
+                 textcolor = color.white,
+                 style     = label.style_label_right,
+                 size      = size.small)
+            array.push(sess_boxes,  bxn)
+            array.push(sess_labels, ln2)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PLOTSHAPE SIGNALS — Global scope, all bars, no accumulation
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Delta footprint
+plotshape(show_fp and is_anomaly and delta > 0,
+          title="D+ Bull", location=location.belowbar,
+          style=shape.triangleup, color=color.new(#26A69A, 0), size=size.small, text="D+")
+
+plotshape(show_fp and is_anomaly and delta < 0,
+          title="D- Bear", location=location.abovebar,
+          style=shape.triangledown, color=color.new(color.red, 0), size=size.small, text="D-")
+
+// MSS
+plotshape(show_mss and mss_bull and not trap_from_bull,
+          title="MSS Bull", location=location.belowbar,
+          style=shape.arrowup, color=color.new(color.lime, 0), size=size.small, text="MSS")
+
+plotshape(show_mss and mss_bear and not trap_from_bear,
+          title="MSS Bear", location=location.abovebar,
+          style=shape.arrowdown, color=color.new(color.red, 0), size=size.small, text="MSS")
+
+// TRAP
+plotshape(show_trap and trap_from_bull,
+          title="TRAP Bear", location=location.abovebar,
+          style=shape.arrowdown, color=color.new(#FF5722, 0), size=size.small, text="TRAP")
+
+plotshape(show_trap and trap_from_bear,
+          title="TRAP Bull", location=location.belowbar,
+          style=shape.arrowup, color=color.new(#4CAF50, 0), size=size.small, text="TRAP")
+
+// Confluence grades — plotshape requires const string, one call per grade per direction
+plotshape(mss_bull and bull_pts >= 4, title="Bull A+", location=location.belowbar, style=shape.labelup,   color=color.new(color.green, 10), textcolor=color.white, size=size.small, text="A+")
+plotshape(mss_bull and bull_pts == 3, title="Bull B",  location=location.belowbar, style=shape.labelup,   color=color.new(color.green, 30), textcolor=color.white, size=size.small, text="B")
+plotshape(mss_bull and bull_pts == 2, title="Bull C",  location=location.belowbar, style=shape.labelup,   color=color.new(color.green, 55), textcolor=color.white, size=size.small, text="C")
+plotshape(mss_bear and bear_pts >= 4, title="Bear A+", location=location.abovebar, style=shape.labeldown, color=color.new(color.red,   10), textcolor=color.white, size=size.small, text="A+")
+plotshape(mss_bear and bear_pts == 3, title="Bear B",  location=location.abovebar, style=shape.labeldown, color=color.new(color.red,   30), textcolor=color.white, size=size.small, text="B")
+plotshape(mss_bear and bear_pts == 2, title="Bear C",  location=location.abovebar, style=shape.labeldown, color=color.new(color.red,   55), textcolor=color.white, size=size.small, text="C")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ──────────────────────────────────────────────────────────────────────────────
+var table dash = na
+
+if show_dash and barstate.islast
+    if na(dash)
+        dash := table.new(
+                position     = position.bottom_right,
+                columns      = 2,
+                rows         = 6,
+                bgcolor      = color.new(color.black, 15),
+                border_color = color.gray,
+                border_width = 1,
+                frame_color  = color.gray,
+                frame_width  = 1)
+
+    delta_pct = total_vol > 0 ? delta / total_vol * 100 : 0.0
+    d_col     = delta > 0 ? color.teal : color.red
+
+    table.cell(dash, 0, 0, "PSP PRO",       text_color=color.white,  bgcolor=color.new(color.gray,  50), text_size=size.small)
+    table.cell(dash, 1, 0, "IC Analytics",  text_color=color.yellow, bgcolor=color.new(color.gray,  50), text_size=size.tiny)
+    table.cell(dash, 0, 1, "Bull BO Count", text_color=color.teal,   bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(bull_bo),   text_color=color.teal,   bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 0, 2, "Bear BO Count", text_color=color.red,    bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(bear_bo),   text_color=color.red,    bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 0, 3, "TP Hits",       text_color=color.green,  bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(tp_hits),   text_color=color.green,  bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 0, 4, "Fake Outs",     text_color=color.orange, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(fake_outs), text_color=color.orange, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 0, 5, "Delta %",       text_color=d_col,        bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(dash, 1, 5, str.tostring(math.round(delta_pct, 1)) + "%", text_color=d_col, bgcolor=color.new(color.black, 40), text_size=size.small)
+
+if not show_dash and not na(dash)
+    table.delete(dash)
+    dash := na

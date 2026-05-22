@@ -1,0 +1,255 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © Infusion Capital — Volume Profile + Footprint Aproximado v1.0 (Corregido y Optimizado - Gravity Edition)
+// @version=6
+indicator("IC — Volume Profile + Footprint (Gravity)", shorttitle="IC VP+FP Gravity", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=200)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────────────────────────
+grp1 = "Volume Profile"
+vp_lookback   = input.int(200,    "Barras para el perfil",        minval=50,  maxval=500,  group=grp1)
+vp_rows       = input.int(24,     "Filas del perfil (niveles)",   minval=10,  maxval=48,   group=grp1)
+vp_width      = input.int(20,     "Ancho visual (% del chart)",   minval=5,   maxval=40,   group=grp1)
+va_pct        = input.float(0.70, "Value Area %",                 minval=0.5, maxval=0.9,  step=0.05, group=grp1)
+
+grp2 = "Colores VP"
+col_poc       = input.color(color.new(color.yellow, 0),   "POC",           group=grp2)
+col_va        = input.color(color.new(color.blue,   70),  "Value Area",    group=grp2)
+col_gap       = input.color(color.new(color.purple, 50),  "Volume Gap",    group=grp2)
+col_bull_bar  = input.color(color.new(color.teal,   30),  "Barra Alcista", group=grp2)
+col_bear_bar  = input.color(color.new(color.red,    30),  "Barra Bajista", group=grp2)
+
+grp3 = "Footprint"
+show_fp       = input.bool(true, "Mostrar Footprint (Delta)",              group=grp3)
+ltf           = input.timeframe("1", "Timeframe inferior (LTF)",           group=grp3)
+fp_threshold  = input.float(1.5, "Umbral Delta anomalo (x vol promedio)", minval=1.0, maxval=5.0, step=0.1, group=grp3)
+
+grp4 = "Panel Delta"
+show_delta    = input.bool(true, "Mostrar panel Delta", group=grp4)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FOOTPRINT — TICK RULE via LTF (Manejo Seguro)
+// ──────────────────────────────────────────────────────────────────────────────
+ltf_close = request.security_lower_tf(syminfo.tickerid, ltf, close)
+ltf_open  = request.security_lower_tf(syminfo.tickerid, ltf, open)
+ltf_vol   = request.security_lower_tf(syminfo.tickerid, ltf, volume)
+
+calc_buy_vol(l_close, l_open, l_vol) =>
+    total = 0.0
+    if array.size(l_close) > 0
+        for i = 0 to array.size(l_close) - 1
+            c = array.get(l_close, i)
+            o = array.get(l_open,  i)
+            v = array.get(l_vol,   i)
+            if not na(c) and not na(o) and not na(v)
+                if c >= o
+                    total += v
+    total
+
+calc_sell_vol(l_close, l_open, l_vol) =>
+    total = 0.0
+    if array.size(l_close) > 0
+        for i = 0 to array.size(l_close) - 1
+            c = array.get(l_close, i)
+            o = array.get(l_open,  i)
+            v = array.get(l_vol,   i)
+            if not na(c) and not na(o) and not na(v)
+                if c < o
+                    total += v
+    total
+
+buy_vol   = calc_buy_vol(ltf_close,  ltf_open, ltf_vol)
+sell_vol  = calc_sell_vol(ltf_close, ltf_open, ltf_vol)
+delta     = buy_vol  - sell_vol
+total_vol = buy_vol  + sell_vol
+
+avg_vol    = ta.sma(total_vol, 20)
+is_anomaly = math.abs(delta) > nz(avg_vol) * fp_threshold
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VOLUME PROFILE — Calculo
+// ──────────────────────────────────────────────────────────────────────────────
+var float[] vp_prices = array.new_float(0)
+var float[] vp_vols   = array.new_float(0)
+var float[] vp_buys   = array.new_float(0)
+var float[] vp_sells  = array.new_float(0)
+
+highest_high = ta.highest(high, vp_lookback)
+lowest_low   = ta.lowest(low,  vp_lookback)
+price_range  = math.max(highest_high - lowest_low, syminfo.mintick) // Evita division por cero
+row_size     = price_range / vp_rows
+
+var float poc_price = na
+var float vah_price = na
+var float val_price = na
+
+// Contenedores persistentes para evitar acumulacion en tiempo real
+var box[]   vp_boxes  = array.new_box(0)
+var line[]  vp_lines  = array.new_line(0)
+var label[] vp_labels = array.new_label(0)
+
+if barstate.islast
+
+    // Limpieza de cajas previas antes de redibujar
+    if array.size(vp_boxes) > 0
+        for b in vp_boxes
+            box.delete(b)
+        array.clear(vp_boxes)
+
+    // Limpieza de lineas previas
+    if array.size(vp_lines) > 0
+        for ln in vp_lines
+            line.delete(ln)
+        array.clear(vp_lines)
+
+    // Limpieza de etiquetas previas
+    if array.size(vp_labels) > 0
+        for l in vp_labels
+            label.delete(l)
+        array.clear(vp_labels)
+
+    array.clear(vp_prices)
+    array.clear(vp_vols)
+    array.clear(vp_buys)
+    array.clear(vp_sells)
+
+    for row = 0 to vp_rows - 1
+        array.push(vp_prices, lowest_low + row * row_size + row_size / 2)
+        array.push(vp_vols,   0.0)
+        array.push(vp_buys,   0.0)
+        array.push(vp_sells,  0.0)
+
+    for i = 0 to vp_lookback - 1
+        bar_high  = nz(high[i])
+        bar_low   = nz(low[i])
+        bar_vol   = nz(volume[i])
+        bar_close = nz(close[i])
+        bar_open  = nz(open[i])
+        bar_buy   = bar_close >= bar_open ? bar_vol * 0.6 : bar_vol * 0.4
+        bar_sell  = bar_vol - bar_buy
+
+        for row = 0 to vp_rows - 1
+            row_low      = lowest_low + row * row_size
+            row_high     = row_low + row_size
+            overlap_low  = math.max(bar_low,  row_low)
+            overlap_high = math.min(bar_high, row_high)
+            if overlap_high > overlap_low and (bar_high - bar_low) > 0
+                frac = (overlap_high - overlap_low) / (bar_high - bar_low)
+                array.set(vp_vols,  row, array.get(vp_vols,  row) + bar_vol  * frac)
+                array.set(vp_buys,  row, array.get(vp_buys,  row) + bar_buy  * frac)
+                array.set(vp_sells, row, array.get(vp_sells, row) + bar_sell * frac)
+
+    // POC
+    max_vol      = array.max(vp_vols)
+    total_vp_vol = array.sum(vp_vols)
+    poc_idx      = array.indexof(vp_vols, max_vol)
+    poc_price   := array.get(vp_prices, poc_idx)
+
+    // Value Area
+    va_target = total_vp_vol * va_pct
+    va_vol    = max_vol
+    upper_idx = poc_idx
+    lower_idx = poc_idx
+
+    while va_vol < va_target
+        can_go_up   = upper_idx < vp_rows - 1
+        can_go_down = lower_idx > 0
+        vol_up   = can_go_up   ? array.get(vp_vols, upper_idx + 1) : 0.0
+        vol_down = can_go_down ? array.get(vp_vols, lower_idx - 1) : 0.0
+
+        if vol_up >= vol_down and can_go_up
+            upper_idx += 1
+            va_vol    += vol_up
+        else if can_go_down
+            lower_idx -= 1
+            va_vol    += vol_down
+        else
+            break
+
+    // FIX #3: VAH/VAL usan la parte superior/inferior real de la fila
+    vah_price := array.get(vp_prices, upper_idx) + row_size / 2
+    val_price := array.get(vp_prices, lower_idx) - row_size / 2
+
+    // Dibujar barras del perfil
+    bar_width = math.round(vp_lookback * vp_width / 100)
+
+    for row = 0 to vp_rows - 1
+        row_vol   = array.get(vp_vols,   row)
+        row_price = array.get(vp_prices, row)
+        row_buy   = array.get(vp_buys,   row)
+        norm_width = max_vol > 0 ? math.round(row_vol / max_vol * bar_width) : 1
+        norm_width := math.max(norm_width, 1)
+
+        is_poc = row == poc_idx
+        is_va  = row >= lower_idx and row <= upper_idx
+        is_gap = row_vol < total_vp_vol * 0.005
+
+        // FIX #1: Prioridad de color — POC > VA > Gap > Bull/Bear
+        color bar_color = na
+        if is_poc
+            bar_color := col_poc
+        else if is_va
+            bar_color := col_va
+        else if is_gap
+            bar_color := col_gap
+        else if (row_buy / math.max(row_vol, 1)) > 0.5
+            bar_color := col_bull_bar
+        else
+            bar_color := col_bear_bar
+
+        // FIX #4: box_top/bottom usan 0.50 (sin gap entre filas)
+        box_top    = row_price + row_size * 0.50
+        box_bottom = row_price - row_size * 0.50
+        box_right  = bar_index - vp_lookback + norm_width
+
+        bx = box.new(left=bar_index - vp_lookback, top=box_top, right=box_right, bottom=box_bottom, bgcolor=bar_color, border_color=color.new(bar_color, 80), border_width=1)
+        array.push(vp_boxes, bx)
+
+    // FIX #3: Lineas y etiquetas alineadas (linea hasta +15, label en +17)
+    ln_poc = line.new(x1=bar_index - vp_lookback, y1=poc_price, x2=bar_index + 15, y2=poc_price, color=col_poc, width=2)
+    ln_vah = line.new(x1=bar_index - vp_lookback, y1=vah_price, x2=bar_index + 15, y2=vah_price, color=color.new(color.blue, 40), width=1, style=line.style_dashed)
+    ln_val = line.new(x1=bar_index - vp_lookback, y1=val_price, x2=bar_index + 15, y2=val_price, color=color.new(color.blue, 40), width=1, style=line.style_dashed)
+
+    array.push(vp_lines, ln_poc)
+    array.push(vp_lines, ln_vah)
+    array.push(vp_lines, ln_val)
+
+    l_poc = label.new(bar_index + 17, poc_price, "POC " + str.tostring(math.round(poc_price, 2)), color=col_poc,                      textcolor=color.black, style=label.style_label_left, size=size.small)
+    l_vah = label.new(bar_index + 17, vah_price, "VAH " + str.tostring(math.round(vah_price, 2)), color=color.new(color.blue, 40),    textcolor=color.white, style=label.style_label_left, size=size.small)
+    l_val = label.new(bar_index + 17, val_price, "VAL " + str.tostring(math.round(val_price, 2)), color=color.new(color.blue, 40),    textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    array.push(vp_labels, l_poc)
+    array.push(vp_labels, l_vah)
+    array.push(vp_labels, l_val)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FOOTPRINT — Marcas de Delta anomalo
+// ──────────────────────────────────────────────────────────────────────────────
+plotshape(show_fp and is_anomaly and delta > 0, title="Delta Alcista Anomalo",  location=location.belowbar, style=shape.triangleup,   color=color.new(color.teal, 0), size=size.small, text="D+")
+plotshape(show_fp and is_anomaly and delta < 0, title="Delta Bajista Anomalo",  location=location.abovebar, style=shape.triangledown,  color=color.new(color.red,  0), size=size.small, text="D-")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PANEL DELTA — Tabla
+// ──────────────────────────────────────────────────────────────────────────────
+var table delta_table = na
+
+if show_delta and barstate.islast
+    if na(delta_table)
+        delta_table := table.new(position.bottom_right, 2, 4, bgcolor=color.new(color.black, 20), border_color=color.gray, border_width=1, frame_color=color.gray, frame_width=1)
+
+    delta_pct = total_vol > 0 ? delta / total_vol * 100 : 0.0
+    d_color   = delta > 0 ? color.teal : color.red
+
+    table.cell(delta_table, 0, 0, "DELTA PANEL",      text_color=color.white,  bgcolor=color.new(color.gray, 60), text_size=size.small)
+    table.cell(delta_table, 1, 0, "Infusion Capital", text_color=color.yellow, bgcolor=color.new(color.gray, 60), text_size=size.tiny)
+    table.cell(delta_table, 0, 1, "Buy Vol",          text_color=color.teal,   bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(delta_table, 1, 1, str.tostring(math.round(buy_vol)),  text_color=color.teal, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(delta_table, 0, 2, "Sell Vol",         text_color=color.red,    bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(delta_table, 1, 2, str.tostring(math.round(sell_vol)), text_color=color.red,  bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(delta_table, 0, 3, "Delta",            text_color=d_color,      bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(delta_table, 1, 3, str.tostring(math.round(delta_pct, 1)) + "%", text_color=d_color, bgcolor=color.new(color.black, 40), text_size=size.small)
+
+// FIX #2: table.delete() elimina la tabla completamente (sin ghost frame)
+if not show_delta and not na(delta_table)
+    table.delete(delta_table)
+    delta_table := na
